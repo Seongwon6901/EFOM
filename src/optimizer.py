@@ -1186,9 +1186,14 @@ def optimize_rcot_for_ts_scalar(
         )
 
     else:
-        margin_fn = make_margin_fn_excel_delta(
-            price_provider, total_spyro_yield_for_now, spyro_ctx, fg_constants
+        # ✅ use base margin; wire ML utilities only when requested
+        margin_fn = make_margin_fn(
+            price_provider,
+            fg_cost_mode=('ml' if margin_mode == 'ml' else 'none'),
+            util_models=util_models,
+            util_feature_cols=util_feature_cols,
         )
+
 
     return optimize_rcot_scalar_anchored(
         gp=gp, X_12h=X_12h, merged_lims=merged_lims, pipeline=pipeline, ml_cached=ml_cached,
