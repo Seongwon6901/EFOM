@@ -1,0 +1,226 @@
+from __future__ import annotations
+import json
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, Sequence, List, Optional, Tuple, Any
+from src.ml_predictor import MLPredictor, MLPredictorConfig
+
+import numpy as np
+import pandas as pd
+
+from importlib import reload
+import src.gp_residuals as gpmod
+import src.optimizer    as opt
+
+import src.data_loading as dl; reload(dl)
+from src.data_loading import DataPaths, ResampleConfig, DataPipeline
+
+
+paths = DataPaths(
+    input_dir=Path("input"), inter_dir=Path("intermediate"),
+    prod_excel="1. 생산량 Data_'23.07~'25.05_R1_송부용.xlsx",
+    furn_excel="2. Furnace Data_'23.07~'25.05_R0.xlsx",
+    nap_excel ="Nap Feed 조성분석값.xlsx",
+    gas_excel ="Gas Feed 조성분석값.xlsx",
+    recycle_excel="6. 에탄 및 프로판 데이터.xlsx",
+    # cost_excel="마진가격_vModel_v250625.xlsx",
+    price_csv= "price.csv",
+    util_excel="#1ECU 유틸리티사용량일별데이터.xlsx",
+    fresh_excel="7. Gas Furnace Feed Data_'23.07~'25.05_r2.xlsx",
+
+    # PKL caches (optional)
+    prod_pkl="df_production_v4.pkl", furn_pkl="furnace.pkl",
+    nap_pkl ="df_feed_naptha.pkl", gas_pkl ="df_feed_gas.pkl",
+    fresh_pkl= 'df_feed_fresh_v3.pkl', rec_pkl ="df_recycle.pkl",
+    prod_header=2, furn_header=2, nap_header=1, gas_header=1, rec_header=4, fresh_header=3
+)
+cfg = ResampleConfig(hour_freq='h', win12_freq='12h', win12_offset='9h')
+
+
+feature_rename = {
+    # map your util feature names → canonical (only if you use util models)
+    'Naph': 'Naphtha_chamber1', 'T-DAO': 'T-DAO_chamber1', 'DS': 'DS_chamber1',
+    'RCOT Ave.': 'RCOT_chamber1', 'Excess O2': "Excess O2_chamber1",
+    'Naph.1': 'Naphtha_chamber2', 'T-DAO.1': 'T-DAO_chamber2','DS.1': 'DS_chamber2',
+    'RCOT Ave..1': 'RCOT_chamber2', 'Excess O2.1': "Excess O2_chamber2",
+    'Naph.2': 'Naphtha_chamber3', 'T-DAO.2': 'T-DAO_chamber3','DS.2': 'DS_chamber3',
+    'RCOT Ave..2': 'RCOT_chamber3', 'Excess O2.2': "Excess O2_chamber3",
+    'Naph.3': 'Naphtha_chamber4', 'GAS': 'Gas Feed_chamber4','DS.3': 'DS_chamber4',
+    'RCOT Ave..3': 'RCOT_chamber4', 'Excess O2.3': "Excess O2_chamber4",
+    'Naph.4': 'Naphtha_chamber5', 'GAS.1': 'Gas Feed_chamber5','DS.4': 'DS_chamber5',
+    'RCOT Ave..4': 'RCOT_chamber5', 'Excess O2.4': "Excess O2_chamber5",
+    'Naph.5': 'Naphtha_chamber6', 'GAS.2': 'Gas Feed_chamber6','DS.5': 'DS_chamber6',
+    'RCOT Ave..5': 'RCOT_chamber6', 'Excess O2.5': "Excess O2_chamber6",
+}
+target_rename  = { 'Unnamed: 36':'steam','ECU F/G':'fuel_gas','ECU Elec..1':'electricity' }
+
+dp = DataPipeline(paths, cfg).run(feature_rename, target_rename)
+art = dp.artifacts()
+X_12h, Y_12h, util_df, prices_df = art['X_12h'], art['Y_12h'], art['util_df'], art['price_df']
+
+# clamp horizon (LIMS)
+X_12h = X_12h.loc[:END]
+Y_12h = Y_12h.loc[:END]
+print(X_12h.shape, Y_12h.shape)
+
+
+# 1. Load frames
+# paths, X_12h, Y_12h, prices_df = _load_frames(args)
+
+# 2. Load LIMS and merge
+# merged_lims = _load_lims(paths, args)
+# X_12h = _merge_lims_into_X(X_12h, merged_lims, args)
+
+# 3. Now safe to call gp_residuals functions
+gpmod.set_rcot_groups_from_columns(X_12h.columns)
+
+# Discover RCOT column groups for geometry-aware setters
+gpmod.set_rcot_groups_from_columns(X_12h.columns)
+
+# Utility: get a simple price map ($/ton) at a timestamp from prices_df
+
+def price_map_at(prices_df: pd.DataFrame, ts: pd.Timestamp) -> dict:
+    # Adjust the column names below if yours differ
+    # Typical columns: 'Ethylene','Propylene','Mixed C4','RPG','Hydrogen','Tail Gas'
+    cols = {
+        'Ethylene':'Ethylene',
+        'Propylene':'Propylene',
+        'MixedC4':'Mixed C4',
+        'RPG':'RPG',
+        'Hydrogen':'Hydrogen',
+        'Tail_Gas':'Tail Gas',
+    }
+    # asof join: last known price <= ts
+    p = {}
+    for pkey, col in cols.items():
+        if col in prices_df.columns:
+            s = prices_df[col].sort_index().asof(ts)
+            p[pkey] = float(0.0 if pd.isna(s) else s)
+        else:
+            p[pkey] = 0.0
+    return p
+
+gpmod.set_rcot_groups_from_columns(X_12h.columns)
+
+# 1) Fit GP on ACT-SRTO (no ML needed)
+start = str(X_12h.index.min())
+end   = str(X_12h.index.max())
+
+
+df_train = gpmod.GPResiduals.build_training_table(
+    X_12h=X_12h, Y_12h=Y_12h, merged_lims=merged_lims, pipeline=pipeline,
+    start=start, end=end, residual_kind="act"   # ← no ML required
+)
+gp = gpmod.GPResiduals().fit_parallel(df_train)  # or .fit(df_train)
+
+
+# Choose a timestamp and a grid
+ts = pd.Timestamp("2025-05-01 12:00:00")   # example — pick any index from X_12h
+rc_bounds_map = {
+    "LF_NAPH": (830.0, 860.0),
+    "GF_GAS":  (860.0, 890.0),
+    "HYBRID":  (830.0, 860.0),
+}
+setter_map = {
+    "LF_NAPH": gpmod.rcot_setter_lf_naph,
+    "GF_GAS":  gpmod.rcot_setter_gf_gas,
+    "HYBRID":  gpmod.rcot_setter_hybrid,
+}
+
+price_per_ton = price_map_at(prices_df, ts)
+
+curves_by_geom = {}
+for geom, (lo, hi) in rc_bounds_map.items():
+    rc_grid = np.arange(lo, hi + 1e-9, 1.0, dtype=float)
+    curve, x_used = gpmod.anchored_curve_at_ts(
+        gp=gp, X_12h=X_12h, merged_lims=merged_lims, pipeline=pipeline, ml=ml.predict_row(x_row=X_12h.loc[ts]),
+        ts=ts, rcot_setter=setter_map[geom], rc_grid=rc_grid,
+        use_gp_delta=True, alpha=0.2
+    )
+    if curve.empty:
+        continue
+
+    # revenue = Σ price[p] * corrected_tph[p]
+    rev = np.zeros(len(curve))
+    for p, price in price_per_ton.items():
+        # curve columns use product keys exactly as in gp_residuals.PRODUCTS
+        col = f'{p}_CORR_tph'
+        if col in curve.columns:
+            rev += price * curve[col].to_numpy(float)
+
+    curve = curve.copy()
+    curve['REVENUE_per_h'] = rev
+    curves_by_geom[geom] = curve
+
+# Example: best RCOT per geometry
+best = {
+    geom: {
+        'rc_opt': float(df.loc[df['REVENUE_per_h'].idxmax(), 'RCOT']),
+        'revenue': float(df['REVENUE_per_h'].max())
+    }
+    for geom, df in curves_by_geom.items()
+}
+print(best)
+
+def rcot_setter_single(col_name: str):
+    def _setter(row: pd.Series, rc: float) -> pd.Series:
+        if col_name in row.index:
+            row[col_name] = float(rc)
+        return row
+    return _setter
+
+# find your chamber RCOT columns (adapt names if needed)
+single_rcot_cols = [c for c in X_12h.columns if str(c).startswith('RCOT_chamber')]
+
+revenue_curves_by_furnace = {}
+
+for col in single_rcot_cols:
+    rc_grid = np.arange(830.0, 860.0 + 1e-9,1.0)  # wider if you want
+    curve, x_used = gpmod.anchored_curve_at_ts(
+        gp=gp, X_12h=X_12h, merged_lims=merged_lims, pipeline=pipeline, ml=ml.predict_row(x_row=X_12h.loc[ts]),
+        ts=ts, rcot_setter=rcot_setter_single(col), rc_grid=rc_grid,
+        use_gp_delta=True, alpha=0.2
+    )
+    if curve.empty:
+        continue
+
+    rev = np.zeros(len(curve))
+    for p, price in price_per_ton.items():
+        col_corr = f'{p}_CORR_tph'
+        if col_corr in curve.columns:
+            rev += price * curve[col_corr].to_numpy(float)
+    curve = curve.copy()
+    curve['REVENUE_per_h'] = rev
+    revenue_curves_by_furnace[col] = curve
+
+# Example: best RCOT per furnace column
+best_furn = {
+    col: {
+        'rc_opt': float(df.loc[df['REVENUE_per_h'].idxmax(), 'RCOT']),
+        'revenue': float(df['REVENUE_per_h'].max())
+    }
+    for col, df in revenue_curves_by_furnace.items()
+}
+print(best_furn)
+
+# You can plot the curves similarly to the previous example
+import matplotlib.pyplot as plt
+plt.figure(figsize=(10, 6))
+for col, df in revenue_curves_by_furnace.items():
+    plt.plot(df['RCOT'], df['REVENUE_per_h'], marker='o', label=col)
+    plt.title(f"Revenue vs RCOT @ {ts:%Y-%m-%d %H:%M}")
+    plt.xlabel('RCOT (u00b0C)')
+    plt.ylabel('Revenue ($/h)')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+plt.show()
+
+# You can also save the curves to CSV files if needed
+for geom, df in curves_by_geom.items():
+    df.to_csv(f'mass_balance_curve_{geom}_{ts:%Y%m%d_%H%M}.csv', index=False)
+
+# For furnace-specific curves
+for col, df in revenue_curves_by_furnace.items():
+    df.to_csv(f'revenue_curve_{col}_{ts:%Y%m%d_%H%M}.csv', index=False)
+# Note: Adjust the column names and ranges as per your actual dataset and requirements.
