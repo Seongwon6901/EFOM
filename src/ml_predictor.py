@@ -31,6 +31,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn import set_config
+set_config(transform_output="pandas")
 
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
@@ -327,6 +329,8 @@ class MLPredictor:
                 # StandardScaler(with_mean=False),  # robust for sparse-like col scales
                 LGBMRegressor(**self.cfg.lgbm_params)
             )
+            pipe.set_output(transform="pandas")
+
             pipe.fit(X, Y[t])
             self.models[t] = pipe
         return self
@@ -380,7 +384,10 @@ class MLPredictor:
 
         # (A) fill lag1 from Y_for_lags if available
         if Y_for_lags is not None and self.target_cols:
-            lags = Y_for_lags[self.target_cols].shift(1)
+            # lags = Y_for_lags[self.target_cols].shift(1)
+            # Be robust to missing targets (e.g., PFO not simulated/cached in closed-loop)
+            lags = Y_for_lags.reindex(columns=self.target_cols).shift(1)
+
             ts = df_row.index[0]
             if ts in lags.index:
                 for t in self.target_cols:
@@ -408,8 +415,11 @@ class MLPredictor:
             if f not in df_row.columns:
                 df_row[f] = np.nan
 
-        arr = df_row[self.feature_cols].to_numpy()
-        out = {t: float(pipe.predict(arr)[0]) for t, pipe in self.models.items()}
+        # arr = df_row[self.feature_cols].to_numpy()
+        # out = {t: float(pipe.predict(arr)[0]) for t, pipe in self.models.items()}
+        arr_df = df_row[self.feature_cols]          # keep as DataFrame
+        out = {t: float(pipe.predict(arr_df)[0]) for t, pipe in self.models.items()}
+
         return out
     def _add_comp_features_inplace(self, X: pd.DataFrame) -> None:
         """Build compact composition features from gas mol% and PONA totals."""

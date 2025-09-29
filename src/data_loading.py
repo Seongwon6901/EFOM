@@ -49,6 +49,36 @@ def load_pickle_or_excel(
 # ─────────────────────────────────────────────────────────────────────────────
 # LIMS (daily feeds) loaders/cleaners
 # ─────────────────────────────────────────────────────────────────────────────
+# put this near your other top-level cleaners
+def clean_pona_from_pi(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy().reset_index(drop=True)
+    ts_col = d.columns[0]
+    out = d[[ts_col]].rename(columns={ts_col: 'Timestamp'})
+
+    exact = {
+        "M10L41004_Paraffins(vol%)":  "Paraffins",
+        "M10L41004_Olefins(vol%)":    "Olefins",
+        "M10L41004_Naphthenes(vol%)": "Naphthenes",
+        "M10L41004_Aromatics(vol%)":  "Aromatics",
+        "M10L41004_n-Paraffin(vol%)": "n-Paraffin",
+        "M10L41004_i-Paraffin(vol%)": "i-Paraffin",
+    }
+    for src, dst in exact.items():
+        if src in d.columns:
+            out[dst] = pd.to_numeric(d[src], errors='coerce')
+
+    if "Paraffins" not in out.columns:
+        npar = out.get("n-Paraffin")
+        ipar = out.get("i-Paraffin")
+        if npar is not None or ipar is not None:
+            out["Paraffins"] = (npar.fillna(0) if npar is not None else 0) + \
+                               (ipar.fillna(0) if ipar is not None else 0)
+
+    out["Timestamp"] = pd.to_datetime(out["Timestamp"], errors="coerce").dt.tz_localize(None)
+    out = out.set_index("Timestamp").sort_index()
+
+    keep = [c for c in ["Paraffins","Olefins","Naphthenes","Aromatics"] if c in out.columns]
+    return out[keep]
 
 def load_feed_data(nap_path=None, gas_path=None, paths=None, header=1):
     """
@@ -89,37 +119,105 @@ def load_feed_data(nap_path=None, gas_path=None, paths=None, header=1):
 
     return merged_lims
 
+# def clean_feed_df(df, is_gas=False):
+#     """Clean feed dataframes exported from Excel into a timeseries-indexed numeric DF."""
+#     df = df.copy()
+
+#     if isinstance(df.index, pd.RangeIndex) and len(df) > 2:
+#         df = df.drop([0, 1], axis=0)
+#         df = df.iloc[:, 2:]
+#         if 'Unnamed: 2' in df.columns:
+#             df = df.rename(columns={'Unnamed: 2': 'Timestamp'})
+
+#     if 'Timestamp' in df.columns:
+#         df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+#         df = df.set_index('Timestamp')
+
+#     if not isinstance(df.index, pd.DatetimeIndex):
+#         try:
+#             df.index = pd.to_datetime(df.index)
+#         except Exception:
+#             pass
+
+#     df = df.drop(columns=['Unnamed: 3', 'Unnamed: 4', 'Unnamed: 5'], errors='ignore')
+
+#     if is_gas:
+#         for col in ['Ethylene', 'Ethane', 'Propylene', 'Propane', 'n-Butane', 'i-Butane']:
+#             if col in df.columns:
+#                 df[col] = pd.to_numeric(df[col], errors='coerce')
+#     else:
+#         if 'Paraffins' in df.columns:
+#             df['Paraffins'] = pd.to_numeric(df['Paraffins'], errors='coerce')
+
+#     return df
 def clean_feed_df(df, is_gas=False):
-    """Clean feed dataframes exported from Excel into a timeseries-indexed numeric DF."""
     df = df.copy()
 
+    # normalize common lab tag names → simple headers
+    rename_map = {
+        "M10L41004_Paraffins(vol%)":  "Paraffins",
+        "M10L41004_Olefins(vol%)":    "Olefins",
+        "M10L41004_Naphthenes(vol%)": "Naphthenes",
+        "M10L41004_Aromatics(vol%)":  "Aromatics",
+    }
+    df = df.rename(columns=rename_map)
+
+    # existing timestamp handling…
     if isinstance(df.index, pd.RangeIndex) and len(df) > 2:
         df = df.drop([0, 1], axis=0)
         df = df.iloc[:, 2:]
         if 'Unnamed: 2' in df.columns:
             df = df.rename(columns={'Unnamed: 2': 'Timestamp'})
-
     if 'Timestamp' in df.columns:
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
         df = df.set_index('Timestamp')
-
     if not isinstance(df.index, pd.DatetimeIndex):
-        try:
-            df.index = pd.to_datetime(df.index)
-        except Exception:
-            pass
-
-    df = df.drop(columns=['Unnamed: 3', 'Unnamed: 4', 'Unnamed: 5'], errors='ignore')
+        try: df.index = pd.to_datetime(df.index)
+        except: pass
+    df = df.drop(columns=['Unnamed: 3','Unnamed: 4','Unnamed: 5'], errors='ignore')
 
     if is_gas:
-        for col in ['Ethylene', 'Ethane', 'Propylene', 'Propane', 'n-Butane', 'i-Butane']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+        for col in ['Ethylene','Ethane','Propylene','Propane','n-Butane','i-Butane']:
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
     else:
-        if 'Paraffins' in df.columns:
-            df['Paraffins'] = pd.to_numeric(df['Paraffins'], errors='coerce')
+        for col in ['Paraffins','Olefins','Naphthenes','Aromatics']:
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
 
     return df
+
+def _clean_pona_from_pi(self, df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy().reset_index(drop=True)
+    ts_col = d.columns[0]
+    out = d[[ts_col]].rename(columns={ts_col: 'Timestamp'})
+
+    # Exact → canonical
+    exact = {
+        "M10L41004_Paraffins(vol%)":  "Paraffins",
+        "M10L41004_Olefins(vol%)":    "Olefins",
+        "M10L41004_Naphthenes(vol%)": "Naphthenes",
+        "M10L41004_Aromatics(vol%)":  "Aromatics",
+        "M10L41004_n-Paraffin(vol%)": "n-Paraffin",
+        "M10L41004_i-Paraffin(vol%)": "i-Paraffin",
+    }
+    for src, dst in exact.items():
+        if src in d.columns:
+            out[dst] = pd.to_numeric(d[src], errors='coerce')
+
+    # If aggregate Paraffins missing, build from n-/i-
+    if "Paraffins" not in out.columns:
+        npar = out.get("n-Paraffin")
+        ipar = out.get("i-Paraffin")
+        if npar is not None or ipar is not None:
+            out["Paraffins"] = (npar.fillna(0) if npar is not None else 0) + \
+                               (ipar.fillna(0) if ipar is not None else 0)
+
+    out["Timestamp"] = pd.to_datetime(out["Timestamp"], errors="coerce").dt.tz_localize(None)
+    out = out.set_index("Timestamp").sort_index()
+
+    # Keep only the 4 aggregates the rest of the pipeline expects
+    keep = [c for c in ["Paraffins","Olefins","Naphthenes","Aromatics"] if c in out.columns]
+    return out[keep]
+
 
 def clean_furnace_or_production_df(df, n_drop=3, timestamp_colname="Timestamp"):
     """Legacy cleaner for furnace sheet."""
@@ -132,6 +230,7 @@ def clean_furnace_or_production_df(df, n_drop=3, timestamp_colname="Timestamp"):
     df = df.set_index(timestamp_colname)
     df = df.iloc[:, 1:]
     return df
+
 def clean_fresh_feed(df: pd.DataFrame,
                     ts_col_candidates=('Timestamp','Unnamed: 0')) -> pd.DataFrame:
     """
@@ -270,9 +369,9 @@ def _smart_rename_to_canonical(df: pd.DataFrame) -> pd.DataFrame:
             ren[c] = 'RPG'
         elif 'pfo' in k or 'fueloil' in k or 'pyrolysisfueloil' in k:
             ren[c] = 'PFO'
-        elif k == 'hydrogen' or k == 'h2' or 'hydrogen' in k:
+        elif k == 'hydrogen' or k == 'h2' or 'Hydrogen' in k or 'H2' in k:
             ren[c] = 'Hydrogen'
-        elif 'tailgas' in k or ('tail' in k and 'gas' in k):
+        elif 'tailgas' in k or ('tail' in k or 'Tail Gas' in k and 'gas' in k):
             ren[c] = 'Tail Gas'
     return df.rename(columns=ren)
 
@@ -334,10 +433,10 @@ def build_feature_df(df_prod, df_furn, df_naptha, df_gas):
     df_gas = df_gas.rename(columns=gas_rename)
 
     if isinstance(df_naptha, pd.Series):
-        df_naptha = df_naptha.rename('Naphtha_Paraffins')
+        df_naptha = df_naptha.rename('Paraffins')
     else:
         if df_naptha.shape[1] == 1:
-            df_naptha.columns = ['Naphtha_Paraffins']
+            df_naptha.columns = ['Paraffins']
 
     return pd.concat([df_prod, df_furn, df_naptha, df_gas], axis=1)
 
@@ -418,6 +517,7 @@ def process_price_csv(path_or_df) -> pd.DataFrame:
         df = pd.read_csv(path_or_df)
     else:
         df = path_or_df.copy()
+    df.columns = pd.Index([str(c).strip() for c in df.columns])
 
     # timestamp → month index
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
@@ -476,6 +576,9 @@ class DataPaths:
     input_dir: Path
     inter_dir: Path
 
+    # CSV file
+    downloaded_csv: str
+
     # Excel files
     prod_excel: str
     furn_excel: str
@@ -484,6 +587,7 @@ class DataPaths:
     recycle_excel: str
     # cost_excel: str
     util_excel: str
+    input_excel: str
     fresh_excel: str | None = None
     # NEW
     price_csv: str | None = None
@@ -508,6 +612,8 @@ class DataPaths:
     # Your final after-drop indices [2,7,10,11,12,15,16] → +2 here:
     prod_select_positions_1b: Tuple[int, ...] = (4, 9, 12, 13, 14, 17, 18)
 
+    @property
+    def downloaded_csv_path(self): return self.inter_dir / self.downloaded_csv if self.downloaded_csv else None
     @property
     def prod_excel_path(self): return self.input_dir / self.prod_excel
     @property
@@ -535,10 +641,11 @@ class DataPaths:
     @property
     def rec_pkl_path(self): return self.inter_dir / self.rec_pkl
     @property
+    def input_excel_path(self): return self.input_dir / self.input_excel
+    @property
     def fresh_excel_path(self): return self.input_dir / self.fresh_excel if self.fresh_excel else None
     @property
     def fresh_pkl_path(self):   return self.inter_dir / self.fresh_pkl
-
 
 @dataclass
 class ResampleConfig:
@@ -569,93 +676,298 @@ class DataPipeline:
         self._fresh = None
 
     def load_raw(self):
+        """Load raw data from Excel or pickle files for data unavailable from PI Server."""
         p = self.paths
         # Production read RAW; custom cleaner sets header & slices columns
-        self._prod = load_pickle_or_excel(p.prod_pkl_path, p.prod_excel_path, header=None)
 
-        self._furn = load_pickle_or_excel(p.furn_pkl_path, p.furn_excel_path, header=p.furn_header)
+        # Below data are not available from PI Server, so load from files.
         self._nap  = load_pickle_or_excel(p.nap_pkl_path,  p.nap_excel_path,  header=p.nap_header)
         self._gas  = load_pickle_or_excel(p.gas_pkl_path,  p.gas_excel_path,  header=p.gas_header)
-        self._rec  = load_pickle_or_excel(p.rec_pkl_path,  p.recycle_excel_path, header=p.rec_header)
-        self._fresh = load_pickle_or_excel(p.fresh_pkl_path, p.fresh_excel_path, header=p.fresh_header)
+        
+        # Below data are available from PI Server, so skip loading from files.
+        # self._prod = load_pickle_or_excel(p.prod_pkl_path, p.prod_excel_path, header=None)
+        # self._furn = load_pickle_or_excel(p.furn_pkl_path, p.furn_excel_path, header=p.furn_header)
+        # self._rec  = load_pickle_or_excel(p.rec_pkl_path,  p.recycle_excel_path, header=p.rec_header)
+        # self._fresh = load_pickle_or_excel(p.fresh_pkl_path, p.fresh_excel_path, header=p.fresh_header)
 
         return self
 
     def clean(self):
+        """Clean raw dataframes."""
+        # Below data are not available from PI Server, so load from files.
         self._nap  = clean_feed_df(self._nap, is_gas=False)
         self._gas  = clean_feed_df(self._gas, is_gas=True)
-        self._rec  = clean_recycle(self._rec)
 
-        # Exact prod behavior (header_row=3, data_start_row=5)
-        self._prod = clean_production_df_from_positions(
-            self._prod,
-            header_row=3,
-            data_start_row=5,
-            select_positions_1b=self.paths.prod_select_positions_1b
-        )
+        # Below data are available from PI Server, so skip cleaning from files.
+        # self._rec  = clean_recycle(self._rec)
+        # # Exact prod behavior (header_row=3, data_start_row=5)
+        # self._prod = clean_production_df_from_positions(
+        #     self._prod,
+        #     header_row=3,
+        #     data_start_row=5,
+        #     select_positions_1b=self.paths.prod_select_positions_1b
+        # )
 
-        # Furnace sheet via legacy cleaner
-        self._furn = clean_furnace_or_production_df(self._furn)
-        if self._fresh is not None:
-            self._fresh = clean_fresh_feed(self._fresh)
+        # # Furnace sheet via legacy cleaner
+        # self._furn = clean_furnace_or_production_df(self._furn)
+        # if self._fresh is not None:
+        #     self._fresh = clean_fresh_feed(self._fresh)
 
         return self
 
-    def resample(self):
-        # Daily feeds
-        nap_daily = self._nap['Paraffins'].resample('D').mean()
-        gas_daily = self._gas.resample('D').mean()
+    def load_data(self):
+        """Load and clean data for the field available from the PI Server"""
+        p = self.paths
 
+        df = pd.read_csv(self.paths.downloaded_csv_path) if p.downloaded_csv_path and p.downloaded_csv_path.exists() else None
+        df.columns = pd.Index([str(c).strip() for c in df.columns])
+        if df is None:
+            raise FileNotFoundError(f"Downloaded CSV not found at {p.downloaded_csv_path}")
+
+        # Below data are available from PI Server, so load from the downloaded CSV.
+        self._prod = self._clean_production_df(df)
+        self._furn = self._clean_furnace_df(df)
+        self._rec = self._clean_recycle_df(df)
+        self._fresh = self._clean_fresh_df(df)
+        
+        # Below data are not available from PI Server, so load from files.
+        self._nap = clean_pona_from_pi(df)
+        self._gas = self._clean_gas_df(df)
+
+        return self
+
+    def _clean_production_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Custom cleaner for the downloaded production CSV - Refer 'source' sheet from EFOM_input_data_tag_list.xlsx"""
+        df = df.copy()
+        df.reset_index(drop=True)
+
+        ts_col = df.columns[0]
+        out = df[[ts_col]].copy().rename(columns={ts_col: 'Timestamp'})
+
+        out["Ethylene"]   = df["M10FI5265"] - (df["M10FI5070"] / 1000.0)
+        out["Propylene"]  = df["M10FIC6301"]
+        out["MixedC4"]    = df["M10FIC6362_CORR"]
+        out["RPG"]        = df["M15FIC002_CORR"] + df["M10FI6384_CORR"]
+        out["PFO"]        = df["PFO_FLOW_TANK"]
+        out["C2Recycle"]  = df["M10FIC5201"]
+        out["C3Recycle"]  = np.where(df["M10FIC1008"] == -1, 0.0,
+                                 df["M10FIC6101"])
+        out["Hydrogen"]   = df["M10FI4246_CORR"] / 1000.0
+
+        to_hmu = np.where(df["M10FIC3652"] > 0, df["M10FIC3652"], 0.0)
+        out["Tail Gas"]   = df["M10FIC4247_CORR"] / 1000.0 + df["M10FIC3587_CORR"] + df["M10FI3588_CORR"] + to_hmu
+
+        if 'Timestamp' in out.columns:
+            out['Timestamp'] = pd.to_datetime(out['Timestamp'], errors='coerce')
+            out['Timestamp'] = out['Timestamp'].dt.tz_localize(None)
+            out = out.set_index('Timestamp')
+        
+        return out
+
+    def _clean_furnace_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Custom cleaner for the downloaded furnace CSV"""
+        df = df.copy()
+        df.reset_index(drop=True)
+
+        ts_col = df.columns[0]
+        out = df[[ts_col]].copy().rename(columns={ts_col: 'Timestamp'})
+
+        p = self.paths
+        mapping = pd.read_excel(p.input_excel_path, sheet_name='furnace_tag_mapping', usecols=["tags", "output_column_name"]).dropna()
+        mapping["tags"] = mapping["tags"].str.strip()
+        mapping["output_column_name"] = mapping["output_column_name"].str.strip()
+
+        available_tags = [c for c in mapping["tags"].tolist() if c in df.columns]
+        tag_df = df[available_tags].copy()
+
+        rename_dict = dict(zip(mapping["tags"], mapping["output_column_name"]))
+        tag_df = tag_df.rename(columns=rename_dict)
+        
+        out = pd.concat([out, tag_df], axis=1)
+
+        if 'Timestamp' in out.columns:
+            out['Timestamp'] = pd.to_datetime(out['Timestamp'], errors='coerce')
+            out['Timestamp'] = out['Timestamp'].dt.tz_localize(None)
+            out = out.set_index('Timestamp')
+
+        return out
+
+    def _clean_recycle_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Custom cleaner for the downloaded recycle CSV - Refer 'source' sheet from EFOM_input_data_tag_list.xlsx"""
+        df = df.copy()
+        df.reset_index(drop=True)
+
+        ts_col = df.columns[0]
+        out = df[[ts_col]].copy().rename(columns={ts_col: 'Timestamp'})
+
+        out["Ethane"]  = df["M10FIC5201"]
+        out["Propane"] = df["M10FIC6101"] - np.where(df["M10FIC1008"] == -1, 0.0, df["M10FIC1008"] / 1000.0)
+
+        if 'Timestamp' in out.columns:
+            out['Timestamp'] = pd.to_datetime(out['Timestamp'], errors='coerce')
+            out['Timestamp'] = out['Timestamp'].dt.tz_localize(None)
+            out = out.set_index('Timestamp')
+
+        return out
+    
+    def _clean_fresh_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Custom cleaner for the downloaded fresh feed CSV - Refer 'source' sheet from EFOM_input_data_tag_list.xlsx"""
+        df = df.copy()
+        df.reset_index(drop=True)
+
+        ts_col = df.columns[0]
+        out = df[[ts_col]].copy().rename(columns={ts_col: 'Timestamp'})
+
+        out["FreshFeed_C3 LPG"]     = df["M10FIC1003"]
+        out["FreshFeed_MX Offgas"]  = df["M10FI1016"]
+        out["feed_qty"]             = out[["FreshFeed_C3 LPG", "FreshFeed_MX Offgas"]].sum(axis=1)
+
+        if 'Timestamp' in out.columns:
+            out['Timestamp'] = pd.to_datetime(out['Timestamp'], errors='coerce')
+            out['Timestamp'] = out['Timestamp'].dt.tz_localize(None)
+            out = out.set_index('Timestamp')
+
+        return out
+    
+    def _clean_nap_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Custom cleaner for the downloaded naptha CSV - Refer 'source' sheet from EFOM_input_data_tag_list.xlsx"""
+        df = df.copy()
+        df.reset_index(drop=True)
+
+        ts_col = df.columns[0]
+        out = df[[ts_col]].copy().rename(columns={ts_col: 'Timestamp'})
+
+        out["n-Paraffin"] = df["M10L41004_C4 n-Paraffin(vol%)"] + df["M10L41004_C5 n-Paraffin(vol%)"] + df["M10L41004_C6 n-Paraffin(vol%)"] + df["M10L41004_C7 n-Paraffin(vol%)"] + df["M10L41004_C8 n-Paraffin(vol%)"] + df["M10L41004_C9 n-Paraffin(vol%)"] + df["M10L41004_C10 n-Paraffin(vol%)"] + df["M10L41004_C11+ n-Paraffin(vol%)"]
+        out["i-Paraffin"] = df["M10L41004_C4 i-Paraffin(vol%)"] + df["M10L41004_C5 i-Paraffin(vol%)"] + df["M10L41004_C6 i-Paraffin(vol%)"] + df["M10L41004_C7 i-Paraffin(vol%)"] + df["M10L41004_C8 i-Paraffin(vol%)"] + df["M10L41004_C9 i-Paraffin(vol%)"] + df["M10L41004_C10 i-Paraffin(vol%)"] + df["M10L41004_C11+ i-Paraffin(vol%)"]
+        out["Paraffins"]  = out["n-Paraffin"] + out["i-Paraffin"]
+
+        # TODO: Missing columns
+        # Density, API도, D#IBP, D#10%, D#30%, D#50%, D#70%, D#90%, D#FBP, Sulfur, VP mini, Total Wafer, Olefin, Naphthene, Aromatic, As, Pb, V, N, Ni, Zn, Mercury, R-Cl, Total Nitrogen, MeOH, Total Oxygenates
+
+        if 'Timestamp' in out.columns:
+            out['Timestamp'] = pd.to_datetime(out['Timestamp'], errors='coerce')
+            out['Timestamp'] = out['Timestamp'].dt.tz_localize(None)
+            out = out.set_index('Timestamp')
+
+        return out
+    
+    def _pick(df, *tokens):
+        tokens = [t.lower() for t in tokens]
+        for c in df.columns:
+            s = str(c).lower()
+            if all(t in s for t in tokens):
+                return c
+        return None
+
+    
+    # def _clean_gas_df(self, df: pd.DataFrame) -> pd.DataFrame:
+    #     """Custom cleaner for the downloaded gas CSV - Refer 'source' sheet from EFOM_input_data_tag_list.xlsx"""
+    #     df = df.copy()
+    #     df.reset_index(drop=True)
+
+    #     ts_col = df.columns[0]
+    #     out = df[[ts_col]].copy().rename(columns={ts_col: 'Timestamp'})
+
+    #     out["Ethylene"]  = df["M10G31003_Ethylene(mol%)"]
+    #     out["Ethane"]    = df["M10G31003_Ethane(mol%)"]
+    #     out["Propylene"] = df["M10G31003_Propylene(mol%)"]
+    #     out["Propane"]   = df["M10G31003_Propane(mol%)"]
+    #     out["n-Butane"]  = df["M10G31003_n-Butane(mol%)"]
+    #     out["i-Butane"]  = df["M10G31003_i-Butane(mol%)"]
+
+    #     # TODO: Missing columns
+    #     # out["Total Sulfur"]     = df["xxxxxx"]
+    #     # out["MeOH"]             = df["xxxxxx"]
+    #     # out["Total Oxygenates"] = df["xxxxxx"]
+
+    #     if 'Timestamp' in out.columns:
+    #         out['Timestamp'] = pd.to_datetime(out['Timestamp'], errors='coerce')
+    #         out['Timestamp'] = out['Timestamp'].dt.tz_localize(None)
+    #         out = out.set_index('Timestamp')
+
+    #     return out
+
+    def _clean_gas_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy().reset_index(drop=True)
+        ts_col = df.columns[0]
+        out = df[[ts_col]].copy().rename(columns={ts_col: 'Timestamp'})
+
+        # prefer exact names; fallback to token search
+        def col(name, *tokens):
+            return name if name in df.columns else _pick(df, *tokens)
+
+        c = {
+            'Ethylene':  col("M10G31003_Ethylene(mol%)",  "G31003","ethylene","mol"),
+            'Ethane':    col("M10G31003_Ethane(mol%)",    "G31003","ethane","mol"),
+            'Propylene': col("M10G31003_Propylene(mol%)", "G31003","propylene","mol"),
+            'Propane':   col("M10G31003_Propane(mol%)",   "G31003","propane","mol"),
+            'n-Butane':  col("M10G31003_n-Butane(mol%)",  "G31003","n-butane","mol"),
+            'i-Butane':  col("M10G31003_i-Butane(mol%)",  "G31003","i-butane","mol"),
+        }
+
+        for k, src in c.items():
+            if src is not None:
+                out[k] = pd.to_numeric(df[src], errors='coerce')
+
+        out['Timestamp'] = pd.to_datetime(out['Timestamp'], errors='coerce').dt.tz_localize(None)
+        out = out.set_index('Timestamp')
+        return out
+
+
+    def resample(self):
+        # 1) Numeric copies
         prod_num = self._prod.apply(pd.to_numeric, errors='coerce')
         furn_num = self._furn.apply(pd.to_numeric, errors='coerce')
         rec_num  = self._rec.apply(pd.to_numeric, errors='coerce')
 
-        # 12H label-based resampling — trailing bins (closed='right', label='right')
+        # 2) 12h resampling (label/right, trailing bins)
         prod_12h = prod_num.resample(
-            self.cfg.win12_freq, offset=self.cfg.win12_offset,
-            label='right', closed='right'
+            self.cfg.win12_freq, offset=self.cfg.win12_offset, label='right', closed='right'
         ).mean()
         furn_12h = clean_furnace_columns(
             furn_num.resample(
-                self.cfg.win12_freq, offset=self.cfg.win12_offset,
-                label='right', closed='right'
+                self.cfg.win12_freq, offset=self.cfg.win12_offset, label='right', closed='right'
             ).mean()
         )
         rec_12h  = rec_num.resample(
-            self.cfg.win12_freq, offset=self.cfg.win12_offset,
-            label='right', closed='right'
+            self.cfg.win12_freq, offset=self.cfg.win12_offset, label='right', closed='right'
         ).mean()
 
-        # canonicalize again for safety, then map canonical → *_prod
+        # 3) Canonicalize production and rename → *_prod
         prod_12h = _smart_rename_to_canonical(prod_12h)
         to_prod = {
-            'Ethylene':'Ethylene_prod',
-            'Propylene':'Propylene_prod',
-            'Mixed C4':'MixedC4_prod',
-            'RPG':'RPG_prod',
-            'PFO':'PFO_prod',
-            'Hydrogen':'Hydrogen_prod',
-            'Tail Gas':'Tail_Gas_prod',
+            'Ethylene':'Ethylene_prod','Propylene':'Propylene_prod','Mixed C4':'MixedC4_prod',
+            'RPG':'RPG_prod','PFO':'PFO_prod','Hydrogen':'Hydrogen_prod','Tail Gas':'Tail_Gas_prod',
         }
         prod_12h = prod_12h.rename(columns={k:v for k,v in to_prod.items() if k in prod_12h.columns})
 
-        # Recycle → *_prod (if present)
+        # Recycle → *_prod
         prod_12h = pd.concat([prod_12h, rec_12h], axis=1).rename(columns={
             'Ethane':'Ethane_prod', 'Propane':'Propane_prod'
         })
 
-        # Align feeds to production index (kept in X for other models if needed)
+        # 4) Now do PONA/gas daily → 12h, aligned to prod_12h.index
+        pona_cols = [c for c in ['Paraffins','Olefins','Naphthenes','Aromatics'] if c in self._nap.columns]
+        nap_daily = self._nap[pona_cols].resample('D').mean()
+        gas_daily = self._gas.resample('D').mean()
+
         nap_12h = reindex_ffill(nap_daily, prod_12h.index)
         gas_12h = reindex_ffill(gas_daily, prod_12h.index)
 
-        # Features
+        # Prefix naphtha columns
+        if isinstance(nap_12h, pd.Series):
+            nap_12h = nap_12h.rename('Paraffins')
+        else:
+            nap_12h = nap_12h.rename(columns={c: f'{c}' for c in nap_12h.columns})
+
+        # 5) Build features
         self.X_12h = build_feature_df(prod_12h, furn_12h, nap_12h, gas_12h)
         try:
             build_virtual_rcots_inplace(self.X_12h)
         except Exception:
             pass
 
-        # Targets (t+1): include Hydrogen/Tail Gas when present
+        # 6) Targets (t+1)
         target_pool = [
             'Ethylene_prod','Propylene_prod','MixedC4_prod','RPG_prod','PFO_prod',
             'Hydrogen_prod','Tail_Gas_prod','Ethane_prod','Propane_prod'
@@ -663,25 +975,15 @@ class DataPipeline:
         available = [c for c in target_pool if c in prod_12h.columns]
         if not available:
             raise RuntimeError("No target columns found in production data after canonical mapping.")
-
         self.Y_12h = prod_12h[available].shift(-1)
         self.Y_12h.columns = [f"{c}_t+1" for c in self.Y_12h.columns]
 
-        # Fresh feed → 12h (trailing), align to X index, then concat ONLY feed_qty
+        # 7) Fresh feed (optional)
         if self._fresh is not None:
             fresh_12h = (self._fresh
-                         .resample(self.cfg.win12_freq, offset=self.cfg.win12_offset,
-                                   label='right', closed='right')
-                         .mean())
-            # Align to X_12h index and forward-fill
+                        .resample(self.cfg.win12_freq, offset=self.cfg.win12_offset, label='right', closed='right')
+                        .mean())
             fresh_12h = fresh_12h.reindex(self.X_12h.index).ffill()
-            # Ensure feed_qty exists
-            # if 'feed_qty' not in fresh_12h.columns:
-            #     numeric_cols = fresh_12h.select_dtypes(include=[np.number]).columns
-            #     fresh_12h['feed_qty'] = fresh_12h[numeric_cols].sum(axis=1)
-            # # Keep only feed_qty to avoid column collisions
-            # fresh_12h = fresh_12h[['feed_qty']]
-            # Add into X
             self.X_12h = pd.concat([self.X_12h, fresh_12h], axis=1)
 
         return self
@@ -702,13 +1004,58 @@ class DataPipeline:
         else:
             self.price_df = process_util_cost(self.paths.cost_excel_path)
         return self
+    
+    def build_prices_from_df(self):
+        p = self.paths
+
+        df = pd.read_csv(self.paths.downloaded_csv_path) if p.downloaded_csv_path and p.downloaded_csv_path.exists() else None
+        if df is None:
+            raise FileNotFoundError(f"Downloaded CSV not found at {p.downloaded_csv_path}")
+        
+        df.columns = pd.Index([str(c).strip() for c in df.columns])
+
+        
+        df = df.copy()
+        df.reset_index(drop=True)
+
+        ts_col = df.columns[0]
+        out = df[[ts_col]].copy().rename(columns={ts_col: 'Timestamp'})
+
+        mapping = pd.read_excel(p.input_excel_path, sheet_name='price_tag_mapping', usecols=["tags", "output_column_name"]).dropna()
+        mapping["tags"] = mapping["tags"].str.strip()
+        mapping["output_column_name"] = mapping["output_column_name"].str.strip()
+
+        available_tags = [c for c in mapping["tags"].tolist() if c in df.columns]
+        tag_df = df[available_tags].copy()
+
+        rename_dict = dict(zip(mapping["tags"], mapping["output_column_name"]))
+        tag_df = tag_df.rename(columns=rename_dict)
+        
+        out = pd.concat([out, tag_df], axis=1)
+
+        if 'Timestamp' in out.columns:
+            # Convert datetime
+            out['Timestamp'] = pd.to_datetime(out['Timestamp'], errors='coerce')
+            out['Timestamp'] = out['Timestamp'].dt.tz_localize(None)
+
+            # Convert into YYYY-MM-DD format
+            out['month'] = out['Timestamp'].dt.strftime('%Y-%m-%d')
+
+            # Setting the column as an index
+            out = out.drop(columns=['Timestamp']).set_index('month')
+
+        self.price_df = out
+
+        return self
 
     def run(self, util_feature_rename: Dict[str, str], util_target_rename: Dict[str, str]):
         return (self.load_raw()
                 .clean()
+                .load_data()
                 .resample()
                 .build_util(util_feature_rename, util_target_rename)
-                .build_prices())
+                # .build_prices())
+                .build_prices_from_df())
 
     def artifacts(self) -> Dict[str, Any]:
         return {

@@ -1,0 +1,35 @@
+import pandas as pd
+from .curves import SpyroCurveBank
+
+class SpyroAbs:
+    GEOM = {'LF_NAPH':'04. LF_NAPH MODE_SRTO7.SPY7',
+            'GF_GAS' :'07. GF_GAS MODE_SRTO7.SPY7',
+            'GF_HYB_NAPH':'01. GF_HYBRID MODE_SRTO7_NAPH.SPY7'}
+    PROD = {'Ethylene':'C2H4','Propylene':'C3H6','MixedC4':'MixedC4','RPG':'RPG',
+            'Ethane':'Ethane','Propane':'Propane','Fuel_Gas':'Fuel_Gas'}
+
+    def __init__(self, bank: SpyroCurveBank):
+        self.bank = bank
+
+    def _pct(self, gkey, prod, rc, ts): return self.bank.percent(gkey, prod, rc, ts, morning_prev=True)
+
+    def abs_total(self, row: pd.Series, short_key: str) -> float:
+        ts   = pd.Timestamp(row.name) if row.name is not None else pd.Timestamp('1970-01-01 21:00')
+        prod = self.PROD.get(short_key, short_key)
+        total = 0.0
+        for ch in (1,2,3):
+            n = float(row.get(f'Naphtha_chamber{ch}',0.0))
+            if n>0:
+                rc = float(row.get(f'RCOT_chamber{ch}', float('nan')))
+                total += (self._pct(self.GEOM['LF_NAPH'], prod, rc, ts)/100.0)*n
+        for ch in (4,5,6):
+            n = float(row.get(f'Naphtha_chamber{ch}',0.0))
+            if n>0:
+                rc = float(row.get(f'RCOT_naphtha_chamber{ch}', float('nan')))
+                total += (self._pct(self.GEOM['GF_HYB_NAPH'], prod, rc, ts)/100.0)*n
+        for ch in (4,5,6):
+            g = float(row.get(f'Gas Feed_chamber{ch}',0.0))
+            if g>0:
+                rc = float(row.get(f'RCOT_gas_chamber{ch}', float('nan')))
+                total += (self._pct(self.GEOM['GF_GAS'], prod, rc, ts)/100.0)*g
+        return float(max(0.0, total))

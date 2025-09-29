@@ -34,6 +34,12 @@ import numpy as np
 import pandas as pd
 import warnings
 
+# ---- add near other imports ----
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
 # Silence benign sklearn feature-name warnings
 warnings.filterwarnings(
     "ignore",
@@ -75,6 +81,446 @@ def set_out_dir_base(path: str | Path) -> None:
     global OUT_DIR_BASE
     OUT_DIR_BASE = Path(path)
     OUT_DIR_BASE.mkdir(parents=True, exist_ok=True)
+
+# ---- NEW: PI download wrapper (no top-level PI imports) ----
+def ensure_pi_download(cfg) -> pd.DataFrame:
+    """
+    Run src.pipeline.Pipeline(cfg) and return a DataFrame with a 'timestamp' column.
+    Be tolerant to casing / index, and fall back to the CSV we just saved.
+    """
+    from src.pipeline import Pipeline
+    pl = Pipeline(cfg)
+    df = pl.run()  # writes csv/parquet per cfg, returns DataFrame (ideally)
+
+    def _normalize(df_in):
+        if not isinstance(df_in, pd.DataFrame):
+            return None
+        # 1) if 'timestamp' exists (any case), normalize
+        cols_lower = {c.lower(): c for c in df_in.columns}
+        if 'timestamp' in cols_lower:
+            c = cols_lower['timestamp']
+            out = df_in.copy()
+            if c != 'timestamp':
+                out = out.rename(columns={c: 'timestamp'})
+            out['timestamp'] = pd.to_datetime(out['timestamp'], errors='coerce')
+            return out
+        # 2) if index is a DatetimeIndex, reset to 'timestamp'
+        if isinstance(df_in.index, pd.DatetimeIndex):
+            out = df_in.reset_index()
+            out = out.rename(columns={out.columns[0]: 'timestamp'})
+            out['timestamp'] = pd.to_datetime(out['timestamp'], errors='coerce')
+            return out
+        return None
+
+    out = _normalize(df)
+    if out is not None:
+        return out
+
+    # 3) Fallback: read the just-saved CSV (most reliable)
+    try:
+        csv_path = Path(cfg.out_csv)
+        out = pd.read_csv(csv_path, parse_dates=['timestamp'])
+        return out
+    except Exception:
+        raise RuntimeError(
+            "PI download returned no 'timestamp' column or DatetimeIndex, and CSV fallback failed."
+        )
+
+import re
+import re
+import numpy as np
+import pandas as pd
+
+def _normalize_density_table_for_pona(density_df: pd.DataFrame, bulk_series: pd.Series) -> pd.DataFrame:
+    d = density_df.copy()
+    d = d.rename(columns={
+        'Group': 'Family',
+        'CNR': 'C',
+        'Components Density 15': 'Component Density 15',
+    })
+    d['Family'] = (
+        d['Family'].astype(str).str.lower().str.strip()
+         .str.replace('.', '', regex=False).str.replace(' ', '', regex=False)
+         .replace({
+            'npar': 'n-paraffin',
+            'ipar': 'i-paraffin',
+            'naph': 'naphthene',
+            'olef': 'olefin',
+            'cyclol': 'olefin',      # pool cyclo-olefin under Olefins
+            'arom': 'aromatic',
+         })
+    )
+    def _to_C(v):
+        s = str(v).strip()
+        if s.startswith(('12','12+')): return 12
+        if s.startswith(('11','11+')): return 11
+        return pd.to_numeric(s, errors='coerce')
+    d['C'] = d['C'].map(_to_C)
+
+    rho_mix_med = pd.to_numeric(bulk_series, errors='coerce').median()
+    rho_i_med   = pd.to_numeric(d['Component Density 15'], errors='coerce').median()
+    if pd.notna(rho_mix_med) and pd.notna(rho_i_med):
+        if rho_mix_med > 5 and rho_i_med < 5:        # bulk looks kg/m3, comp looks g/cc
+            d['Component Density 15'] *= 1000.0
+        elif rho_mix_med < 5 and rho_i_med > 5:      # bulk looks g/cc, comp looks kg/m3
+            d['Component Density 15'] /= 1000.0
+    return d
+
+
+# def build_merged_lims_full(
+#     pi_df: pd.DataFrame,
+#     X_12h: pd.DataFrame,
+#     *,
+#     density_df: pd.DataFrame,
+#     bulk_density_col: str = "M10L41004_Density",
+#     tolerance_days: int = 7,
+#     enforce_100: bool = True
+# ) -> pd.DataFrame:
+#     """
+#     Daily LIMS table with:
+#       - all per-carbon PONA columns in (wt%)
+#       - family totals in (wt%)
+#       - tidy PONA columns: ['Paraffins','Olefins','Naphthenes','Aromatics'] (wt%)
+#       - gas columns as-of joined from X_12h
+#     """
+#     df = pi_df.copy()
+#     if 'timestamp' in df.columns:
+#         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+#     elif isinstance(df.index, pd.DatetimeIndex):
+#         df = df.reset_index().rename(columns={'index':'timestamp'})
+#     else:
+#         raise ValueError("pi_df must have 'timestamp' or DatetimeIndex.")
+
+#     # density normalization
+#     dtab = _normalize_density_table_for_pona(density_df, df.get(bulk_density_col, pd.Series(dtype=float)))
+#     dens_map = {(r['Family'], int(r['C'])): float(r['Component Density 15'])
+#                 for _, r in dtab.dropna(subset=['Family','C','Component Density 15']).iterrows()}
+#     fam_medians = dtab.groupby('Family')['Component Density 15'].median(numeric_only=True)
+#     C_medians   = dtab.groupby('C')['Component Density 15'].median(numeric_only=True)
+#     global_med  = float(dtab['Component Density 15'].median()) if pd.notna(dtab['Component Density 15'].median()) else 800.0
+
+#     def get_rho(fam_raw: str, C: int) -> float:
+#         k = (fam_raw, C)
+#         if k in dens_map: return dens_map[k]
+#         if fam_raw in ('n-paraffin','i-paraffin'):
+#             k2 = ('n-paraffin', C)
+#             if k2 in dens_map: return dens_map[k2]
+#         if fam_raw in fam_medians and pd.notna(fam_medians[fam_raw]): return float(fam_medians[fam_raw])
+#         if C in C_medians and pd.notna(C_medians[C]): return float(C_medians[C])
+#         return global_med
+
+#     # match all per-carbon vol% columns (includes C12+ Aromatic)
+#     pat = re.compile(
+#         r"^(?P<prefix>M10L41004)_C(?P<C>12\+|11\+|12|11|10|9|8|7|6|5|4)\s+(?P<FAM>n-?Paraffin|i-?Paraffin|Olefin|Naphthene|Aromatic)\(vol%?\)$",
+#         re.I
+#     )
+#     fam_pool_map = {'n-paraffin':'Paraffins','i-paraffin':'Paraffins',
+#                     'olefin':'Olefins','naphthene':'Naphthenes','aromatic':'Aromatics'}
+
+#     rho_mix = pd.to_numeric(df.get(bulk_density_col), errors='coerce')
+#     percarbon_wt_cols = []
+#     family_parts = {'Paraffins':[], 'n-Paraffin':[], 'i-Paraffin':[], 'Olefins':[], 'Naphthenes':[], 'Aromatics':[]}
+
+#     # compute per-carbon wt% columns
+#     for col in df.columns:
+#         m = pat.match(str(col))
+#         if not m: continue
+#         Ctxt = m.group('C')
+#         Cn   = 12 if Ctxt.startswith('12') else 11 if Ctxt.startswith('11') else int(Ctxt)
+#         fam  = m.group('FAM').lower()
+#         fam  = 'n-paraffin' if fam.startswith('n-') else ('i-paraffin' if fam.startswith('i-') else fam)
+#         fam_pool = fam_pool_map[fam]
+
+#         rho_i = get_rho(fam, Cn)
+#         vol   = pd.to_numeric(df[col], errors='coerce')
+#         wt    = vol * (rho_i / rho_mix)
+#         bad   = ~np.isfinite(rho_mix) | (rho_mix <= 0)
+#         wt.loc[bad] = vol.loc[bad]     # neutral fallback if bulk density missing
+
+#         wt_col = col.replace('(vol%)','(wt%)')
+#         df[wt_col] = wt
+#         percarbon_wt_cols.append(wt_col)
+
+#         family_parts[fam_pool].append(wt_col)
+#         if fam == 'n-paraffin': family_parts['n-Paraffin'].append(wt_col)
+#         if fam == 'i-paraffin': family_parts['i-Paraffin'].append(wt_col)
+
+#     # build family totals (wt%)
+#     prefix = "M10L41004"
+#     totals = {
+#         f"{prefix}_Paraffins(wt%)":  family_parts['Paraffins'],
+#         f"{prefix}_n-Paraffin(wt%)": family_parts['n-Paraffin'],
+#         f"{prefix}_i-Paraffin(wt%)": family_parts['i-Paraffin'],
+#         f"{prefix}_Olefins(wt%)":    family_parts['Olefins'],
+#         f"{prefix}_Naphthenes(wt%)": family_parts['Naphthenes'],
+#         f"{prefix}_Aromatics(wt%)":  family_parts['Aromatics'],
+#     }
+#     for out_col, cols in totals.items():
+#         if cols:
+#             df[out_col] = df[cols].apply(pd.to_numeric, errors='coerce').sum(axis=1, min_count=1)
+
+#     # tidy PONA (Paraffins/Olefins/Naphthenes/Aromatics) from totals
+#     df['Paraffins']   = pd.to_numeric(df.get(f"{prefix}_Paraffins(wt%)"), errors='coerce')
+#     df['Olefins']     = pd.to_numeric(df.get(f"{prefix}_Olefins(wt%)"), errors='coerce')
+#     df['Naphthenes']  = pd.to_numeric(df.get(f"{prefix}_Naphthenes(wt%)"), errors='coerce')
+#     df['Aromatics']   = pd.to_numeric(df.get(f"{prefix}_Aromatics(wt%)"), errors='coerce')
+
+#     # optional renormalization so tidy PONA sums to 100
+#     if enforce_100:
+#         s = df[['Paraffins','Olefins','Naphthenes','Aromatics']].sum(axis=1, min_count=1)
+#         scale = np.where((s>0) & np.isfinite(s), 100.0/s, 1.0)
+#         for c in ['Paraffins','Olefins','Naphthenes','Aromatics']:
+#             df[c] = df[c] * scale
+
+#     # daily last per day for: per-carbon (wt%), totals (wt%), tidy PONA
+#     keep_cols = (percarbon_wt_cols
+#                  + list(totals.keys())
+#                  + ['Paraffins','Olefins','Naphthenes','Aromatics'])
+#     out = df[['timestamp'] + keep_cols].copy()
+#     out['lims_date'] = pd.to_datetime(out['timestamp']).dt.normalize()
+#     daily = (out.sort_values('timestamp')
+#                 .groupby('lims_date', as_index=False)
+#                 .last())
+
+#     # as-of join gas cols from X_12h
+#     gas_cols = [c for c in ['Ethylene','Ethane','Propylene','Propane','n-Butane','i-Butane'] if c in X_12h.columns]
+#     if gas_cols:
+#         g = X_12h[gas_cols].sort_index().reset_index()
+#         g = g.rename(columns={g.columns[0]: 'date'})
+#         g['date'] = pd.to_datetime(g['date'], errors='coerce')
+#         daily = pd.merge_asof(
+#             daily.sort_values('lims_date'),
+#             g.sort_values('date'),
+#             left_on='lims_date',
+#             right_on='date',
+#             direction='backward',
+#             tolerance=pd.Timedelta(days=tolerance_days)
+#         ).drop(columns=['date'])
+
+#         # clean zero rows → NaN then fill
+#         zr = daily[gas_cols].sum(axis=1).fillna(0.0).eq(0.0)
+#         daily.loc[zr, gas_cols] = np.nan
+#         daily[gas_cols] = daily[gas_cols].ffill().bfill()
+
+#     merged_lims = daily.drop(columns=['timestamp']).rename(columns={'lims_date':'date'})
+#     return merged_lims
+
+import pandas as pd, numpy as np, re
+from typing import Sequence, Tuple
+
+TZ = "Asia/Seoul"
+
+def _local_naive(s: pd.Series | pd.DatetimeIndex, tz: str = TZ) -> pd.Series:
+    s = pd.to_datetime(s, errors="coerce")
+    if getattr(getattr(s, "dt", s), "tz", None) is not None:
+        s = s.dt.tz_convert(tz).dt.tz_localize(None)
+    return s
+
+def _make_targets_from_X_range(X_12h: pd.DataFrame,
+                               times: Sequence[str] = ("07:00","19:00"),
+                               tz: str = TZ) -> pd.DataFrame:
+    idx = X_12h.index
+    # treat X_12h stamps as local-naive already; just build date range
+    d0 = pd.to_datetime(idx.min()).normalize()
+    d1 = pd.to_datetime(idx.max()).normalize()
+    days = pd.date_range(d0 - pd.Timedelta(days=1), d1 + pd.Timedelta(days=1), freq="D")
+    targets = []
+    for d in days:
+        for t in times:
+            hh, mm = map(int, t.split(":"))
+            targets.append(d + pd.Timedelta(hours=hh, minutes=mm))
+    return pd.DataFrame({"date": pd.to_datetime(targets)}).sort_values("date").reset_index(drop=True)
+
+def build_merged_lims_full(
+    pi_df: pd.DataFrame,
+    X_12h: pd.DataFrame,
+    *,
+    density_df: pd.DataFrame,
+    bulk_density_col: str = "M10L41004_Density",
+    tolerance_days: int = 7,          # kept for API compat; not used now
+    enforce_100: bool = True,
+    sample_times: Tuple[str,str] = ("07:00","19:00"),
+    sample_tol_hours: int = 6,
+    daily_latest_only: bool = False,   # True → keep only 19:00 per day
+) -> pd.DataFrame:
+    """
+    LIMS table sampled explicitly at 07:00/19:00 (local). For each target stamp,
+    pick the latest PI row at or before the target within sample_tol_hours; ffill across targets.
+    Then as-of join gas columns from X_12h (causal: backward).
+    Returns a DataFrame with a tz-naive 'date' column at 07:00/19:00 stamps.
+    """
+    # ---- PI minute data → local-naive timestamps ----
+    df = pi_df.copy()
+    if "timestamp" in df.columns:
+        ts = _local_naive(df["timestamp"])
+    elif isinstance(df.index, pd.DatetimeIndex):
+        ts = _local_naive(df.index.to_series())
+        df = df.reset_index(drop=True)
+    else:
+        raise ValueError("pi_df must have 'timestamp' or DatetimeIndex.")
+    df["timestamp"] = ts
+    df = df.sort_values("timestamp").dropna(subset=["timestamp"])
+
+    # ---- Build target stamps (07:00/19:00) from X_12h coverage ----
+    targets = _make_targets_from_X_range(X_12h, times=sample_times, tz=TZ)
+    if daily_latest_only:
+        # keep only the later slot (assumed the last time in sample_times, e.g., '19:00')
+        keep_h, keep_m = map(int, sample_times[-1].split(":"))
+        targets["h"] = targets["date"].dt.hour
+        targets["m"] = targets["date"].dt.minute
+        targets = targets.loc[(targets["h"]==keep_h) & (targets["m"]==keep_m), ["date"]]
+
+    # ---- As-of select latest PI row ≤ target (within tolerance) ----
+    tol = pd.Timedelta(hours=sample_tol_hours)
+    sel = pd.merge_asof(
+        left=targets.sort_values("date"), right=df.sort_values("timestamp"),
+        left_on="date", right_on="timestamp", direction="backward", tolerance=tol
+    )
+
+    # If nothing matched (all-NaN), create an empty skeleton and return early
+    if sel.empty:
+        out = targets.copy()
+        out["date"] = pd.to_datetime(out["date"])
+        return out  # just the 'date' column; caller can handle empties
+
+    # ---- DENSITY normalization table (kept from your original) ----
+    dtab = _normalize_density_table_for_pona(density_df, df.get(bulk_density_col, pd.Series(dtype=float)))
+    dens_map = {(r["Family"], int(r["C"])): float(r["Component Density 15"])
+                for _, r in dtab.dropna(subset=["Family","C","Component Density 15"]).iterrows()}
+    fam_medians = dtab.groupby("Family")["Component Density 15"].median(numeric_only=True)
+    C_medians   = dtab.groupby("C")["Component Density 15"].median(numeric_only=True)
+    global_med  = float(dtab["Component Density 15"].median()) if pd.notna(dtab["Component Density 15"].median()) else 800.0
+
+    def _get_rho(fam_raw: str, C: int) -> float:
+        k = (fam_raw, C)
+        if k in dens_map: return dens_map[k]
+        if fam_raw in ("n-paraffin","i-paraffin"):
+            k2 = ("n-paraffin", C)
+            if k2 in dens_map: return dens_map[k2]
+        if fam_raw in fam_medians and pd.notna(fam_medians[fam_raw]): return float(fam_medians[fam_raw])
+        if C in C_medians and pd.notna(C_medians[C]): return float(C_medians[C])
+        return global_med
+
+    # ---- Convert per-carbon vol% → wt% (run only on selected rows) ----
+    pat = re.compile(
+        r"^(?P<prefix>M10L41004)_C(?P<C>12\+|11\+|12|11|10|9|8|7|6|5|4)\s+(?P<FAM>n-?Paraffin|i-?Paraffin|Olefin|Naphthene|Aromatic)\(vol%?\)$",
+        re.I
+    )
+    fam_pool_map = {"n-paraffin":"Paraffins","i-paraffin":"Paraffins",
+                    "olefin":"Olefins","naphthene":"Naphthenes","aromatic":"Aromatics"}
+
+    rho_mix = pd.to_numeric(sel.get(bulk_density_col), errors="coerce")
+    percarbon_wt_cols = []
+    family_parts = {"Paraffins":[], "n-Paraffin":[], "i-Paraffin":[], "Olefins":[], "Naphthenes":[], "Aromatics":[]}
+
+    for col in sel.columns:
+        m = pat.match(str(col))
+        if not m:
+            continue
+        Ctxt = m.group("C")
+        Cn   = 12 if Ctxt.startswith("12") else 11 if Ctxt.startswith("11") else int(Ctxt)
+        fam  = m.group("FAM").lower()
+        fam  = "n-paraffin" if fam.startswith("n-") else ("i-paraffin" if fam.startswith("i-") else fam)
+        fam_pool = fam_pool_map[fam]
+        rho_i = _get_rho(fam, Cn)
+
+        vol = pd.to_numeric(sel[col], errors="coerce")
+        wt  = vol * (rho_i / rho_mix)
+        bad = ~np.isfinite(rho_mix) | (rho_mix <= 0)
+        wt.loc[bad] = vol.loc[bad]  # neutral fallback
+        wt_col = col.replace("(vol%)","(wt%)")
+        sel[wt_col] = wt
+        percarbon_wt_cols.append(wt_col)
+
+        family_parts[fam_pool].append(wt_col)
+        if fam == "n-paraffin": family_parts["n-Paraffin"].append(wt_col)
+        if fam == "i-paraffin": family_parts["i-Paraffin"].append(wt_col)
+
+    prefix = "M10L41004"
+    totals = {
+        f"{prefix}_Paraffins(wt%)":  family_parts["Paraffins"],
+        f"{prefix}_n-Paraffin(wt%)": family_parts["n-Paraffin"],
+        f"{prefix}_i-Paraffin(wt%)": family_parts["i-Paraffin"],
+        f"{prefix}_Olefins(wt%)":    family_parts["Olefins"],
+        f"{prefix}_Naphthenes(wt%)": family_parts["Naphthenes"],
+        f"{prefix}_Aromatics(wt%)":  family_parts["Aromatics"],
+    }
+    for out_col, cols in totals.items():
+        if cols:
+            sel[out_col] = sel[cols].apply(pd.to_numeric, errors="coerce").sum(axis=1, min_count=1)
+
+    sel["Paraffins"]  = pd.to_numeric(sel.get(f"{prefix}_Paraffins(wt%)"), errors="coerce")
+    sel["Olefins"]    = pd.to_numeric(sel.get(f"{prefix}_Olefins(wt%)"), errors="coerce")
+    sel["Naphthenes"] = pd.to_numeric(sel.get(f"{prefix}_Naphthenes(wt%)"), errors="coerce")
+    sel["Aromatics"]  = pd.to_numeric(sel.get(f"{prefix}_Aromatics(wt%)"), errors="coerce")
+
+    if enforce_100:
+        s = sel[["Paraffins","Olefins","Naphthenes","Aromatics"]].sum(axis=1, min_count=1)
+        scale = np.where((s>0) & np.isfinite(s), 100.0/s, 1.0)
+        for c in ["Paraffins","Olefins","Naphthenes","Aromatics"]:
+            sel[c] = sel[c] * scale
+
+    # ---- Keep only target rows; set 'date' (the target stamp), drop raw timestamp ----
+    keep_cols = (percarbon_wt_cols
+                 + list(totals.keys())
+                 + ["Paraffins","Olefins","Naphthenes","Aromatics"])
+    out = sel[["date"] + keep_cols].copy()
+    out["date"] = pd.to_datetime(out["date"])        # tz-naive local stamps (07:00/19:00)
+    out = out.sort_values("date").reset_index(drop=True)
+
+    # ---- Join gas from X_12h (causal: latest ≤ target) ----
+    # prefer canonical names; else accept *_gas and rename
+   # ---- Join gas from X_12h (causal: latest ≤ target) ----
+    canon = ["Ethylene","Ethane","Propylene","Propane","n-Butane","i-Butane"]
+
+    # 1) build a per-column selection map with fallback to *_gas
+    sel_map = {}          # input_col -> output_col (canonical)
+    kept_from_gas = set() # which canonical names came from *_gas input
+    for name in canon:
+        if name in X_12h.columns:
+            sel_map[name] = name
+        elif f"{name}_gas" in X_12h.columns:
+            sel_map[f"{name}_gas"] = name
+            kept_from_gas.add(name)
+        else:
+            # optional extra synonyms
+            for alt in (f"{name} (gas)", f"{name}_comp", f"{name}_mol%", f"{name}_wt%"):
+                if alt in X_12h.columns:
+                    sel_map[alt] = name
+                    kept_from_gas.add(name)
+                    break
+
+    if sel_map:
+        g = X_12h[list(sel_map.keys())].rename(columns=sel_map).copy()  # -> canonical cols
+    else:
+        g = pd.DataFrame(index=X_12h.index)
+
+    # 2) as-of (backward) merge on local-naive timeline
+    g = g.sort_index().reset_index().rename(columns={g.columns[0]: "ts"})  # first col is the index
+    g["ts"] = pd.to_datetime(g["ts"])  # treat as local-naive
+    out = pd.merge_asof(
+        left=out.sort_values("date"),
+        right=g.sort_values("ts"),
+        left_on="date", right_on="ts",
+        direction="backward",
+        tolerance=pd.Timedelta(days=3)
+    ).drop(columns=["ts"])
+
+    # 3) optional: if you want *_gas columns preserved, duplicate canonical to *_gas
+    for name in kept_from_gas:
+        col_gas = f"{name}_gas"
+        if name in out.columns and col_gas not in out.columns:
+            out[col_gas] = out[name]
+
+    # 4) zero rows → NaN → ffill/bfill (use canonical names)
+    gas_names = [c for c in canon if c in out.columns]
+    if gas_names:
+        zr = out[gas_names].sum(axis=1).fillna(0.0).eq(0.0)
+        out.loc[zr, gas_names] = np.nan
+        out[gas_names] = out[gas_names].ffill().bfill()
+
+    return out  # has a tz-naive 'date' column at 07:00 / 19:00
+
 
 
 # =================== HELPERS ===================
@@ -182,26 +628,76 @@ class MLCacheAdapter:
 
 
 # =================== FIDELITY (slope-only gate) ===================
+# def _robust_slope_metrics(curve: pd.DataFrame, prod: str) -> tuple[float,float]:
+#     if curve is None or curve.empty or len(curve) < 3:
+#         return (np.nan, 0.0)
+#     s = curve.get(f'{prod}_SRTO_tph'); c = curve.get(f'{prod}_CORR_tph')
+#     if s is None or c is None: return (np.nan, 0.0)
+#     s = s.to_numpy(float); c = c.to_numpy(float)
+#     ds, dc = np.diff(s), np.diff(c)
+#     ds_f = ds[np.isfinite(ds)]
+#     if ds_f.size == 0: return (np.nan, 0.0)
+#     eps  = 0.01*(np.nanpercentile(np.abs(ds_f),95) + 1e-12)
+#     mask = np.abs(ds) >= eps
+#     if mask.sum() < 3 or not np.isfinite(dc[mask]).all(): return (np.nan, float(mask.mean()))
+#     return (float(np.corrcoef(ds[mask], dc[mask])[0,1]), float(mask.mean()))
 def _robust_slope_metrics(curve: pd.DataFrame, prod: str) -> tuple[float,float]:
     if curve is None or curve.empty or len(curve) < 3:
         return (np.nan, 0.0)
-    s = curve.get(f'{prod}_SRTO_tph'); c = curve.get(f'{prod}_CORR_tph')
-    if s is None or c is None: return (np.nan, 0.0)
+    s = curve.get(f'{prod}_SRTO_tph')
+    if s is None:
+        s = curve.get(f'{prod}_ANCHOR_tph')  # fallback for GAS
+    c = curve.get(f'{prod}_CORR_tph')
+    if s is None or c is None:
+        return (np.nan, 0.0)
+
     s = s.to_numpy(float); c = c.to_numpy(float)
     ds, dc = np.diff(s), np.diff(c)
     ds_f = ds[np.isfinite(ds)]
-    if ds_f.size == 0: return (np.nan, 0.0)
+
+    # If anchor slope is (near) zero, fall back to a monotonicity check on CORR
+    if ds_f.size == 0 or np.nanpercentile(np.abs(ds_f), 95) == 0:
+        dc_f = dc[np.isfinite(dc)]
+        if dc_f.size == 0:
+            return (np.nan, 0.0)
+        eps = 0.01 * (np.nanpercentile(np.abs(dc_f), 95) + 1e-12)
+        mask = np.abs(dc) >= eps
+        if mask.sum() < 3:
+            return (np.nan, float(mask.mean()))
+        sign_ok = np.sign(dc[mask]).min() == np.sign(dc[mask]).max()
+        return (1.0 if sign_ok else -1.0, float(mask.mean()))
+
     eps  = 0.01*(np.nanpercentile(np.abs(ds_f),95) + 1e-12)
     mask = np.abs(ds) >= eps
-    if mask.sum() < 3 or not np.isfinite(dc[mask]).all(): return (np.nan, float(mask.mean()))
+    if mask.sum() < 3 or not np.isfinite(dc[mask]).all():
+        return (np.nan, float(mask.mean()))
     return (float(np.corrcoef(ds[mask], dc[mask])[0,1]), float(mask.mean()))
 
 
 def _rcot_setter_single_knob(knob: str):
+    """
+    Set the requested RCOT and also update compatible alias columns so that
+    both Spyro (often reads 'RCOT_chamberX') and GP/ML (which may use
+    'RCOT_gas_chamberX' / 'RCOT_naphtha_chamberX') see the change.
+    """
+    m = re.match(r'^RCOT_(?:(gas|naphtha)_)?chamber([1-6])$', knob)
     def _setter(row_like: pd.Series, rc: float) -> pd.Series:
-        row_like[knob] = float(rc)
-        return row_like
+        r = row_like.copy()
+        rc = float(rc)
+        r[knob] = rc
+        if m:
+            kind = m.group(1)      # 'gas' | 'naphtha' | None
+            ch   = int(m.group(2))
+            # Generic alias used by some code paths (Spyro/pipeline)
+            r[f'RCOT_chamber{ch}'] = rc
+            # Keep the specific flavors consistent too
+            if kind != 'gas':
+                r[f'RCOT_naphtha_chamber{ch}'] = rc
+            if kind != 'naphtha':
+                r[f'RCOT_gas_chamber{ch}'] = rc
+        return r
     return _setter
+
 
 
 def _local_rc_grid(rc0: float, lo: float, hi: float, halfspan: float = 10.0, n: int = 9) -> np.ndarray:
@@ -261,16 +757,32 @@ def build_knob_fidelity_gate(*, ts, row_current, gp, X_12h, merged_lims, pipelin
             continue
 
         # Fallback: SRTO central difference at rc0 ± 5°C
+        # try:
+        #     dC = 5.0
+        #     def _spot(rc):
+        #         r = row_current.copy(); r[knob] = float(np.clip(rc, lo, hi))
+        #         spot = pipeline.predict_spot_plant(r, comp_row, feed_thr=0.1)
+        #         return spot['totals_tph'] if spot.get('status') == 'ok' else {}
+        #     y_lo = _spot(rc0 - dC); y_hi = _spot(rc0 + dC)
+        #     fd_ok = all(abs(y_hi.get(k,0.0) - y_lo.get(k,0.0)) > 1e-6 for k in KEY)
+        # except Exception:
+        #     fd_ok = False
+
+
+       # Fallback: SRTO central difference at rc0 ± 5°C
         try:
             dC = 5.0
+            set_one = _rcot_setter_single_knob(knob)   # <<< use the alias-aware setter
             def _spot(rc):
-                r = row_current.copy(); r[knob] = float(np.clip(rc, lo, hi))
+                r = set_one(row_current.copy(), float(np.clip(rc, lo, hi)))
                 spot = pipeline.predict_spot_plant(r, comp_row, feed_thr=0.1)
                 return spot['totals_tph'] if spot.get('status') == 'ok' else {}
             y_lo = _spot(rc0 - dC); y_hi = _spot(rc0 + dC)
             fd_ok = all(abs(y_hi.get(k,0.0) - y_lo.get(k,0.0)) > 1e-6 for k in KEY)
         except Exception:
             fd_ok = False
+ 
+
 
         if fd_ok:
             a = max(lo, rc0 - halfspan_fallback); b = min(hi, rc0 + halfspan_fallback)
@@ -517,7 +1029,9 @@ def ensure_ml_preds_for(
 
         # choose lag source (combine so missing columns are tolerated)
         if mode == "closed_loop" and Y_sim_state is not None:
-            Y_lag_src = Y_sim_state.combine_first(Ysrc)
+            # Y_lag_src     Y_lag_src = Ysrc.combine_first(Y_sim_state)
+            Y_lag_src = Ysrc.combine_first(Y_sim_state)
+
         else:
             Y_lag_src = Ysrc
 
@@ -576,6 +1090,7 @@ def run_production(X_12h: pd.DataFrame, Y_12h: pd.DataFrame,
     ml_train_mode = closed_loop_opts.get('ml_train_mode','historical')
     gp_train_mode = closed_loop_opts.get('gp_train_mode','historical')
     cache_tag     = closed_loop_opts.get('cache_tag',    '' if mode=='historical' else '_sim')
+    only_latest = (mode == 'online' and closed_loop_opts.get('online_latest_only', True))
 
     # Out dirs & caches
     global OUT_DIR
@@ -654,6 +1169,9 @@ def run_production(X_12h: pd.DataFrame, Y_12h: pd.DataFrame,
         stamps = _ts_per_day(idx_all, day)
         if not stamps:
             continue
+        if only_latest:
+            stamps = stamps[-1:]     # <── process ONLY the latest stamp of that day
+
         te = stamps[-1] - pd.Timedelta(hours=12)
         ts_train_start = te - LOOKBACK_6M
 
@@ -689,6 +1207,8 @@ def run_production(X_12h: pd.DataFrame, Y_12h: pd.DataFrame,
         for ts in stamps:
             # ---- current row from state ----
             row_current = (X_state if mode=='closed_loop' else X_12h).loc[ts].copy(); row_current.name = ts
+            print(f"\n🕒 {ts:%Y-%m-%d %H:%M} — processing stamp")
+            # print("🔧 ML baseline yields (t+1):", {k: (round(float(v),3) if isinstance(v,(int,float)) else v) for k,v in y0.items()})
 
             # ensure Spyro sees a timestamp
             def _spyro_ts(row_like, short_key, ctx=None, _ts=ts):
@@ -716,8 +1236,12 @@ def run_production(X_12h: pd.DataFrame, Y_12h: pd.DataFrame,
             )
             ml_cached = MLCacheAdapter(pred_cache_spot)
             y0 = ml_cached.predict_row(row_current)
+            # print(y0)
+            print("🔧 ML baseline yields (t+1):", {k: (round(float(v),3) if isinstance(v,(int,float)) else v) for k,v in y0.items()})
+
             m0 = margin_fn(ts, row_current, y0)
             m_real = realized_margin_from_Y(ts, row_current, Y_12h, margin_fn)
+        
 
             # ---- fidelity + knob gate ----
             overrides, fid_detail, fid_summary = auto_alpha_until_pass_for_ts(
@@ -727,6 +1251,7 @@ def run_production(X_12h: pd.DataFrame, Y_12h: pd.DataFrame,
             )
             fid_detail.to_csv((OUT_DIR / "fidelity" / f"fidelity_detail_{ts:%Y%m%d_%H%M}.csv"), index=False)
             fid_summary.to_csv((OUT_DIR / "fidelity" / f"fidelity_summary_{ts:%Y%m%d_%H%M}.csv"), index=False)
+            print("✅ Fidelity alpha search — done")
 
             bounds_by_knob, knob_fid = build_knob_fidelity_gate(
                 ts=ts, row_current=row_current, gp=gp,
@@ -735,6 +1260,9 @@ def run_production(X_12h: pd.DataFrame, Y_12h: pd.DataFrame,
                 halfspan_ok=10.0, halfspan_fallback=2.0
             )
             knob_fid.to_csv(OUT_DIR / "fidelity" / "knob" / f"fidelity_knob_{ts:%Y%m%d_%H%M}.csv", index=False)
+
+            print("✅ Fidelity checks — passed")
+            print("🚀 Optimization — started")
 
             # ---- Optimize (anchored objective) ----
             res = opt.optimize_rcot_for_ts_multi(
@@ -749,11 +1277,14 @@ def run_production(X_12h: pd.DataFrame, Y_12h: pd.DataFrame,
                 margin_mode='excel_delta', fg_constants=fg_consts,
                 alpha_overrides=None,
                 enable_de=True, enable_slsqp=True,
-                bounds_by_knob=bounds_by_knob,
+                bounds_by_knob=None,
                 anchored_from_ml=True,
                 gp=gp, pipeline=pipeline, merged_lims=merged_lims, ml_cached=ml_cached,
                 alpha_default_for_anchor=0.0
+            
             )
+            print("✅ Optimization — done")
+            
 
             row_opt = res['row_opt']; y_opt = res['yields_opt']
             m_base  = res['margin_current_per_h']; m_opt = res['margin_opt_per_h']; d_m = res['improvement_per_h']
@@ -1108,3 +1639,4 @@ __all__ = [
     'build_rcot_schedule_from_recs','apply_schedule_to_X','simulate_path_corrected',
     'default_actuation_logger_factory',
 ]
+ 
